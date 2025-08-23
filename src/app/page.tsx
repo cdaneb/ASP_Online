@@ -1,5 +1,5 @@
 'use client';
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { createClient } from "@supabase/supabase-js";
 import { Button } from "@/components/ui/button";
@@ -15,7 +15,8 @@ import { AlertTriangle, Clock, LogIn, LogOut, Medal, Shield, Trophy } from "luci
  * - Supabase backend (optional) for persistence
  * - LocalStorage fallback for demo/offline
  * - Sign in/out within Monday & Wednesday 19:30–21:30 America/New_York
- * - Live timer while signed in
+ * - Live timer while signed in (HH:MM:SS)
+ * - Auto sign-out at 2 hours (client + DB cron)
  * - Leaderboard by total minutes (all-time)
  * - Simple admin view to see/force sign-outs (guarded by an Admin Key)
  *
@@ -26,6 +27,7 @@ import { AlertTriangle, Clock, LogIn, LogOut, Medal, Shield, Trophy } from "luci
 
 // ---------- Helpers ----------
 const TZ = "America/New_York"; // enforce ASP timezone
+const TWO_HOURS_SEC = 2 * 60 * 60;
 
 function nyNow() {
   // returns a Date object representing current time in America/New_York as wall-clock
@@ -45,6 +47,14 @@ function isAspOpen(date = nyNow()) {
   const start = 19 * 60 + 30;
   const end = 21 * 60 + 30;
   return (isMon || isWed) && minutes >= start && minutes < end;
+}
+
+function pad2(n: number) { return n.toString().padStart(2, '0'); }
+function formatHMS(totalSeconds: number) {
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = Math.floor(totalSeconds % 60);
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
 }
 
 function formatHM(totalMinutes: number) {
@@ -136,7 +146,9 @@ export default function ASPApp() {
   const [adminKey, setAdminKey] = useState("");
   const [allActive, setAllActive] = useState<Array<{session: Session; cadet: Cadet}>>([]);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
-  const intervalRef = useRef<number | null>(null);
+
+  // "now" ticker for live timer (updates every second when signed in)
+  const [nowTs, setNowTs] = useState<number>(Date.now());
 
   // Load cached identity
   useEffect(() => {
@@ -146,16 +158,39 @@ export default function ASPApp() {
     if (s) setActiveSession(JSON.parse(s));
   }, []);
 
-  // Tick for live timer rerenders
+  // Live timer + auto sign-out at 2 hours (client-side safety)
   useEffect(() => {
-    if (!activeSession) return;
-    if (intervalRef.current) window.clearInterval(intervalRef.current);
-    intervalRef.current = window.setInterval(() => {
-      // force a re-render while active
-      setStatusMsg((m) => (m === null ? null : m));
-    }, 1000);
-    return () => { if (intervalRef.current) window.clearInterval(intervalRef.current); };
-  }, [activeSession]);
+    if (!activeSession || activeSession.sign_out) return;
+
+    // 1) tick every second so the HH:MM:SS UI updates
+    const intId = window.setInterval(() => setNowTs(Date.now()), 1000);
+
+    // 2) auto sign-out exactly at 2h after sign_in
+    const startMs = new Date(activeSession.sign_in).getTime();
+    const endMs = startMs + TWO_HOURS_SEC * 1000;
+    const delay = Math.max(0, endMs - Date.now());
+
+    const toId = window.setTimeout(async () => {
+      const iso = new Date(endMs).toISOString();
+      if (hasSupabase && supabase) {
+        await supabase.from('sessions').update({ sign_out: iso }).eq('id', activeSession.id);
+      } else {
+        const hist = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
+        const idx = hist.findIndex(s => s.id === activeSession.id);
+        if (idx>=0) { hist[idx].sign_out = iso; localStorage.setItem(LS_SESSIONS, JSON.stringify(hist)); }
+      }
+      setActiveSession(null);
+      localStorage.removeItem(LS_ACTIVE_SESSION);
+      setStatusMsg("Auto signed out after 2 hours.");
+      fetchLeaderboard();
+      if (adminMode) fetchAllActive();
+    }, delay);
+
+    return () => {
+      window.clearInterval(intId);
+      window.clearTimeout(toId);
+    };
+  }, [activeSession?.id, activeSession?.sign_in, activeSession?.sign_out, adminMode]);
 
   // Demo data for leaderboard if no Supabase
   useEffect(() => { fetchLeaderboard(); if (adminMode) fetchAllActive(); }, [adminMode]);
@@ -396,11 +431,12 @@ export default function ASPApp() {
     if (adminMode) fetchAllActive();
   }
 
-  function currentElapsedMin() {
+  function currentElapsedSec() {
     if (!activeSession) return 0;
     const start = new Date(activeSession.sign_in).getTime();
-    const end = new Date(activeSession.sign_out ?? new Date()).getTime();
-    return msToMin(end - start);
+    const end = activeSession.sign_out ? new Date(activeSession.sign_out).getTime() : nowTs;
+    const sec = Math.max(0, Math.floor((end - start) / 1000));
+    return Math.min(sec, TWO_HOURS_SEC); // cap display at 2h
   }
 
   function totalFor() {
@@ -412,14 +448,22 @@ export default function ASPApp() {
       .reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
   }
 
-  // Admin key guard
+  // Admin key guard (trim + persist)
+  const ADMIN_KEY = (process.env.NEXT_PUBLIC_ASP_ADMIN_KEY ?? '').trim();
+
   useEffect(() => {
-    const k =
-      typeof window !== "undefined"
-        ? ( (window as Window).env?.NEXT_PUBLIC_ASP_ADMIN_KEY ?? process.env.NEXT_PUBLIC_ASP_ADMIN_KEY )
-        : process.env.NEXT_PUBLIC_ASP_ADMIN_KEY;
-    if (k && adminKey && k === adminKey) setAdminMode(true);
-  }, [adminKey]);
+    if (typeof window !== 'undefined' && localStorage.getItem('asp_admin_unlocked') === '1') {
+      setAdminMode(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    const entered = adminKey.trim();
+    if (entered && ADMIN_KEY && entered === ADMIN_KEY) {
+      setAdminMode(true);
+      if (typeof window !== 'undefined') localStorage.setItem('asp_admin_unlocked', '1');
+    }
+  }, [adminKey, ADMIN_KEY]);
 
   const openNow = withinAspHours();
   const nextWindow = useMemo(() => {
@@ -497,7 +541,7 @@ export default function ASPApp() {
             <CardHeader><CardTitle className="text-base flex items-center gap-2"><Clock className="w-4 h-4"/> Live Session</CardTitle></CardHeader>
             <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
               <div className="md:col-span-2">
-                <div className="text-2xl font-semibold">{activeSession? formatHM(currentElapsedMin()) : formatHM(0)}</div>
+                <div className="text-2xl font-semibold">{formatHMS(currentElapsedSec())}</div>
                 <div className="text-sm text-slate-600">{activeSession ? `Signed in at ${new Date(activeSession.sign_in).toLocaleTimeString('en-US', { timeZone: TZ, hour:'numeric', minute:'2-digit' })} ET` : 'Not currently signed in'}</div>
                 {cadet && <div className="text-sm text-slate-600 mt-2">Lifetime: <span className="font-semibold">{formatHM(userTotal)}</span> • PMI days: <span className="font-semibold">{Math.floor(userTotal/240)}</span></div>}
               </div>
