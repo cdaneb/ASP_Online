@@ -16,7 +16,7 @@ import { AlertTriangle, Clock, LogIn, LogOut, Medal, Shield, Trophy } from "luci
  * - LocalStorage fallback for demo/offline
  * - Sign in/out within Monday & Wednesday 19:30–21:30 America/New_York
  * - Live timer while signed in
- * - Leaderboard by total minutes in current term
+ * - Leaderboard by total minutes (all-time)
  * - Simple admin view to see/force sign-outs (guarded by an Admin Key)
  *
  * ENV (optional):
@@ -29,7 +29,6 @@ const TZ = "America/New_York"; // enforce ASP timezone
 
 function nyNow() {
   // returns a Date object representing current time in America/New_York as wall-clock
-  // JS Date is always UTC internally; for comparisons we compute local components in TZ
   return new Date();
 }
 
@@ -57,19 +56,55 @@ function formatHM(totalMinutes: number) {
 function msToMin(ms: number) { return Math.max(0, Math.floor(ms / 60000)); }
 
 // ---------- Persistence boundary ----------
-const supabaseUrl = (typeof window !== 'undefined') ? (window as any).env?.NEXT_PUBLIC_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL : undefined;
-const supabaseKey = (typeof window !== 'undefined') ? (window as any).env?.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY : undefined;
+declare global {
+  interface Window {
+    env?: {
+      NEXT_PUBLIC_SUPABASE_URL?: string;
+      NEXT_PUBLIC_SUPABASE_ANON_KEY?: string;
+      NEXT_PUBLIC_ASP_ADMIN_KEY?: string;
+    };
+  }
+}
+
+const supabaseUrl =
+  typeof window !== "undefined"
+    ? (window as Window).env?.NEXT_PUBLIC_SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL
+    : process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+const supabaseKey =
+  typeof window !== "undefined"
+    ? (window as Window).env?.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    : process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
 const hasSupabase = !!(supabaseUrl && supabaseKey);
 const supabase = hasSupabase ? createClient(supabaseUrl!, supabaseKey!) : null;
 
 // Data shapes
-export type Cadet = {
-  id: string;           // UUID
+type Klass = '3C' | '4C';
+
+interface LeaderboardRow {
   name: string;
-  klass: '3C' | '4C';   // class year
-  company: string;      // e.g., G1
-  created_at?: string;
+  klass: Klass;
+  company: string;
+  total_min: number; // from the RPC
 }
+
+interface ActiveRow {
+  id: string;
+  cadet_id: string;
+  sign_in: string;
+  sign_out: string | null;
+  voided?: boolean;
+  cadets: { id: string; name: string; klass: Klass; company: string };
+}
+
+export type Cadet = {
+  id: string;
+  name: string;
+  klass: Klass;
+  company: string;
+  created_at?: string;
+};
 
 export type Session = {
   id: string;           // UUID
@@ -77,12 +112,17 @@ export type Session = {
   sign_in: string;      // ISO
   sign_out: string | null; // ISO or null if active
   voided?: boolean;
-}
+};
 
 // LocalStorage fallback keys
 const LS_CADET = "asp_current_cadet";
 const LS_ACTIVE_SESSION = "asp_active_session";
 const LS_SESSIONS = "asp_sessions"; // historical for leaderboard demo
+
+// small helper for safe error messages
+function errMsg(e: unknown) {
+  return e instanceof Error ? e.message : String(e);
+}
 
 // ---------- Core Component ----------
 export default function ASPApp() {
@@ -109,10 +149,10 @@ export default function ASPApp() {
   // Tick for live timer rerenders
   useEffect(() => {
     if (!activeSession) return;
-    intervalRef.current && window.clearInterval(intervalRef.current);
+    if (intervalRef.current) window.clearInterval(intervalRef.current);
     intervalRef.current = window.setInterval(() => {
       // force a re-render while active
-      setStatusMsg((m) => m === null ? null : m);
+      setStatusMsg((m) => (m === null ? null : m));
     }, 1000);
     return () => { if (intervalRef.current) window.clearInterval(intervalRef.current); };
   }, [activeSession]);
@@ -122,13 +162,21 @@ export default function ASPApp() {
 
   async function fetchLeaderboard() {
     if (hasSupabase && supabase) {
-      // All-time leaderboard (no date filter)
       const { data, error } = await supabase.rpc('asp_leaderboard_all_time');
       if (!error && data) {
-        setLeaderboard(data.map((r: any) => ({ name: r.name, klass: r.klass, company: r.company, totalMin: Math.floor(r.total_min) })));
+        const typed = data as unknown as LeaderboardRow[];
+        setLeaderboard(
+          typed.map(r => ({
+            name: r.name,
+            klass: r.klass,
+            company: r.company,
+            totalMin: Math.floor(r.total_min),
+          }))
+        );
         return;
       }
     }
+
     // Fallback to localStorage aggregation (all-time)
     const raw = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
     const ids = new Set(raw.map(r => r.cadet_id));
@@ -136,7 +184,9 @@ export default function ASPApp() {
     ids.forEach(id => {
       const c = JSON.parse(localStorage.getItem(`${LS_CADET}_${id}`) || "null") as Cadet | null;
       if (!c) return;
-      const total = raw.filter(s => s.cadet_id === id).reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
+      const total = raw
+        .filter(s => s.cadet_id === id)
+        .reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
       rows.push({ name: c.name, klass: c.klass, company: c.company, totalMin: total });
     });
     rows.sort((a,b) => b.totalMin - a.totalMin);
@@ -145,9 +195,30 @@ export default function ASPApp() {
 
   async function fetchAllActive() {
     if (hasSupabase && supabase) {
-      const { data, error } = await supabase.from('sessions').select('id, cadet_id, sign_in, sign_out, cadets(name, klass, company, id)').is('sign_out', null);
+      const { data, error } = await supabase
+        .from('sessions')
+        .select('id, cadet_id, sign_in, sign_out, voided, cadets(name, klass, company, id)')
+        .is('sign_out', null);
+
       if (!error && data) {
-        setAllActive(data.map((row: any) => ({ session: { id: row.id, cadet_id: row.cadet_id, sign_in: row.sign_in, sign_out: row.sign_out }, cadet: { id: row.cadets.id, name: row.cadets.name, klass: row.cadets.klass, company: row.cadets.company } })));
+        const rows = data as unknown as ActiveRow[];
+        setAllActive(
+          rows.map(row => ({
+            session: {
+              id: row.id,
+              cadet_id: row.cadet_id,
+              sign_in: row.sign_in,
+              sign_out: row.sign_out,
+              voided: row.voided,
+            },
+            cadet: {
+              id: row.cadets.id,
+              name: row.cadets.name,
+              klass: row.cadets.klass,
+              company: row.cadets.company,
+            }
+          }))
+        );
         return;
       }
     } else {
@@ -157,7 +228,7 @@ export default function ASPApp() {
     }
   }
 
-    // ----- Admin maintenance helpers -----
+  // ----- Admin maintenance helpers -----
   async function voidCadetSessions(cadetId: string) {
     try {
       if (hasSupabase && supabase) {
@@ -173,8 +244,8 @@ export default function ASPApp() {
         localStorage.setItem(LS_SESSIONS, JSON.stringify(updated));
       }
       setStatusMsg(`Removed cadet's leaderboard entry.`);
-    } catch (e:any) {
-      setStatusMsg(`Failed to remove entry: ${e.message || e}`);
+    } catch (e: unknown) {
+      setStatusMsg(`Failed to remove entry: ${errMsg(e)}`);
     } finally {
       fetchLeaderboard();
       fetchAllActive();
@@ -196,14 +267,13 @@ export default function ASPApp() {
         localStorage.setItem(LS_SESSIONS, JSON.stringify(updated));
       }
       setStatusMsg("Leaderboard reset complete.");
-    } catch (e:any) {
-      setStatusMsg(`Reset failed: ${e.message || e}`);
+    } catch (e: unknown) {
+      setStatusMsg(`Reset failed: ${errMsg(e)}`);
     } finally {
       fetchLeaderboard();
       fetchAllActive();
     }
   }
-
 
   function withinAspHours() { return isAspOpen(nyNow()); }
 
@@ -221,7 +291,7 @@ export default function ASPApp() {
 
     if (hasSupabase && supabase) {
       // Try to find an existing cadet by identity so multiple people can sign in from the same device
-      const { data: existing, error: findErr } = await supabase
+      const { data: existing } = await supabase
         .from('cadets')
         .select('id')
         .eq('name', typedName)
@@ -230,7 +300,7 @@ export default function ASPApp() {
         .maybeSingle();
 
       if (existing) {
-        c.id = existing.id; // reuse the existing cadet's id
+        c.id = (existing as { id: string }).id; // reuse the existing cadet's id
       }
 
       // Upsert by id (safe if found above or newly generated)
@@ -253,7 +323,6 @@ export default function ASPApp() {
 
     const nowIso = new Date().toISOString();
     let newSession: Session = { id: crypto.randomUUID(), cadet_id: c.id, sign_in: nowIso, sign_out: null };
-
 
     if (hasSupabase && supabase) {
       // Ensure cadet exists (and surface errors clearly)
@@ -282,10 +351,10 @@ export default function ASPApp() {
       }
 
       newSession = {
-        id: data.id,
-        cadet_id: data.cadet_id,
-        sign_in: data.sign_in,
-        sign_out: data.sign_out
+        id: (data as { id: string }).id,
+        cadet_id: (data as { cadet_id: string }).cadet_id,
+        sign_in: (data as { sign_in: string }).sign_in,
+        sign_out: (data as { sign_out: string | null }).sign_out
       };
     } else {
       // local history list
@@ -293,7 +362,6 @@ export default function ASPApp() {
       hist.push(newSession);
       localStorage.setItem(LS_SESSIONS, JSON.stringify(hist));
     }
-
 
     setActiveSession(newSession);
     localStorage.setItem(LS_ACTIVE_SESSION, JSON.stringify(newSession));
@@ -309,7 +377,12 @@ export default function ASPApp() {
     if (hasSupabase && supabase) {
       const { data, error } = await supabase.from('sessions').update({ sign_out: nowIso }).eq('id', activeSession.id).select().single();
       if (error) { setStatusMsg(`Sign-out failed: ${error.message}`); return; }
-      updated = { id: data.id, cadet_id: data.cadet_id, sign_in: data.sign_in, sign_out: data.sign_out };
+      updated = {
+        id: (data as { id: string }).id,
+        cadet_id: (data as { cadet_id: string }).cadet_id,
+        sign_in: (data as { sign_in: string }).sign_in,
+        sign_out: (data as { sign_out: string | null }).sign_out
+      };
     } else {
       const hist = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
       const idx = hist.findIndex(s => s.id === activeSession.id);
@@ -330,16 +403,21 @@ export default function ASPApp() {
     return msToMin(end - start);
   }
 
-  function totalFor(nameFilter?: string) {
+  function totalFor() {
     // Only local aggregation of cached sessions for current user (used to show lifetime total)
     const c = cadet; if (!c) return 0;
     const sessions = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
-    return sessions.filter(s => s.cadet_id === c.id).reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
+    return sessions
+      .filter(s => s.cadet_id === c.id)
+      .reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
   }
 
   // Admin key guard
   useEffect(() => {
-    const k = (typeof window !== 'undefined') ? ((window as any).env?.NEXT_PUBLIC_ASP_ADMIN_KEY || process.env.NEXT_PUBLIC_ASP_ADMIN_KEY) : undefined;
+    const k =
+      typeof window !== "undefined"
+        ? ( (window as Window).env?.NEXT_PUBLIC_ASP_ADMIN_KEY ?? process.env.NEXT_PUBLIC_ASP_ADMIN_KEY )
+        : process.env.NEXT_PUBLIC_ASP_ADMIN_KEY;
     if (k && adminKey && k === adminKey) setAdminMode(true);
   }, [adminKey]);
 
@@ -388,7 +466,7 @@ export default function ASPApp() {
             <CardHeader><CardTitle className="text-base">Your Info</CardTitle></CardHeader>
             <CardContent className="space-y-3">
               <Input placeholder="Full name" value={name} onChange={(e)=>setName(e.target.value)} />
-              <Select value={klass} onValueChange={(v:any)=>setKlass(v)}>
+              <Select value={klass} onValueChange={(v) => setKlass(v as Klass)}>
                 <SelectTrigger><SelectValue placeholder="Class (3C or 4C)" /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="3C">3C</SelectItem>
@@ -447,7 +525,7 @@ export default function ASPApp() {
                 {['all','3C','4C'].map((tab) => (
                   <TabsContent key={tab} value={tab}>
                     <Table>
-                      <TableCaption>Total minutes this term.</TableCaption>
+                      <TableCaption>Total minutes (all-time).</TableCaption>
                       <TableHeader>
                         <TableRow>
                           <TableHead className="w-16">Rank</TableHead>
@@ -470,7 +548,7 @@ export default function ASPApp() {
                           </TableRow>
                         ))}
                         {leaderboard.filter(r => tab==='all' ? true : r.klass===tab).length===0 && (
-                          <TableRow><TableCell colSpan={5} className="text-center text-slate-500">No data yet.</TableCell></TableRow>
+                          <TableRow><TableCell colSpan={6} className="text-center text-slate-500">No data yet.</TableCell></TableRow>
                         )}
                       </TableBody>
                     </Table>
@@ -532,10 +610,10 @@ export default function ASPApp() {
                         <Button size="sm" variant="destructive" onClick={async ()=>{
                           if (!confirm(`Remove ${r.name}'s sessions from leaderboard?`)) return;
                           if (hasSupabase && supabase) {
-                            const { data: cad, error: findErr } = await supabase
+                            const { data: cad } = await supabase
                               .from('cadets').select('id').eq('name', r.name).eq('klass', r.klass).eq('company', r.company).single();
-                            if (findErr || !cad) { setStatusMsg('Could not resolve cadet id.'); return; }
-                            await voidCadetSessions(cad.id);
+                            if (!cad) { setStatusMsg('Could not resolve cadet id.'); return; }
+                            await voidCadetSessions((cad as { id: string }).id);
                           } else if (cadet && cadet.name === r.name) {
                             await voidCadetSessions(cadet.id);
                           }
