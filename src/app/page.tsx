@@ -465,6 +465,16 @@ export default function ASPApp() {
     }
   }, [adminKey, ADMIN_KEY]);
 
+  // --- Admin toggle ---
+  function disableAdmin() {
+    setAdminMode(false);
+    setAdminKey('');
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('asp_admin_unlocked');
+    }
+    setStatusMsg('Admin disabled.');
+  }
+
   const openNow = withinAspHours();
   const nextWindow = useMemo(() => {
     // Compute next ASP window (Mon/Wed 19:30–21:30 ET) text
@@ -614,6 +624,16 @@ export default function ASPApp() {
                 </div>
               ) : (
                 <div className="space-y-3">
+                  {/* Admin status + disable */}
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-green-700 bg-green-50 rounded px-2 py-1">
+                      Admin mode enabled
+                    </div>
+                    <Button size="sm" variant="outline" onClick={disableAdmin}>
+                      Disable admin
+                    </Button>
+                  </div>
+
                   <div className="text-slate-600">Active sessions:</div>
                   <div className="space-y-2">
                     {allActive.length===0 && <div className="text-xs text-slate-500">None</div>}
