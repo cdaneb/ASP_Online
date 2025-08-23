@@ -425,12 +425,11 @@ export default function ASPApp() {
   const nextWindow = useMemo(() => {
     // Compute next ASP window (Mon/Wed 19:30–21:30 ET) text
     const now = nyNow();
-    const day = now.getDay(); // 0 Sun .. 6 Sat
     const targetDays = [1, 3]; // Mon, Wed
     const candidates: Date[] = [];
     for (let add = 0; add < 8; add++) {
       const d = new Date(now); d.setDate(now.getDate() + add);
-      const dow = (d.getDay());
+      const dow = d.getDay();
       if (targetDays.includes(dow)) {
         // 19:30
         const dt = new Date(d);
@@ -452,7 +451,7 @@ export default function ASPApp() {
         <div className="md:col-span-1 space-y-4">
           <Card className="shadow-sm">
             <CardHeader>
-              <CardTitle className="flex items-center gap-2"><Trophy className="w-5 h-5"/> Athena's Study Parthenon</CardTitle>
+              <CardTitle className="flex items-center gap-2"><Trophy className="w-5 h-5"/> Athena&rsquo;s Study Parthenon</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
               <div className="font-medium">Company G1 • 3C & 4C</div>
