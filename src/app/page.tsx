@@ -29,10 +29,7 @@ import { AlertTriangle, Clock, LogIn, LogOut, Medal, Shield, Trophy } from "luci
 const TZ = "America/New_York"; // enforce ASP timezone
 const TWO_HOURS_SEC = 2 * 60 * 60;
 
-function nyNow() {
-  // returns a Date object representing current time in America/New_York as wall-clock
-  return new Date();
-}
+function nyNow() { return new Date(); }
 
 function isAspOpen(date = nyNow()) {
   // ASP hours: Monday & Wednesday 19:30–21:30 local
@@ -89,8 +86,10 @@ const supabaseKey =
 const hasSupabase = !!(supabaseUrl && supabaseKey);
 const supabase = hasSupabase ? createClient(supabaseUrl!, supabaseKey!) : null;
 
-// Data shapes
-type Klass = '3C' | '4C';
+// -------- Types --------
+type Klass = '1C' | '2C' | '3C' | '4C';
+const ALL_KLASSES: Klass[] = ['1C','2C','3C','4C'];
+const TABS: Array<'all' | Klass> = ['all', ...ALL_KLASSES];
 
 interface LeaderboardRow {
   name: string;
@@ -127,7 +126,7 @@ export type Session = {
 // LocalStorage fallback keys
 const LS_CADET = "asp_current_cadet";
 const LS_ACTIVE_SESSION = "asp_active_session";
-const LS_SESSIONS = "asp_sessions"; // historical for leaderboard demo
+const LS_SESSIONS = "asp_sessions";
 
 // small helper for safe error messages
 function errMsg(e: unknown) {
@@ -137,11 +136,11 @@ function errMsg(e: unknown) {
 // ---------- Core Component ----------
 export default function ASPApp() {
   const [cadet, setCadet] = useState<Cadet | null>(null);
-  const [klass, setKlass] = useState<'3C'|'4C'|'none'>("none");
+  const [klass, setKlass] = useState<Klass | 'none'>("none");
   const [name, setName] = useState("");
   const [company, setCompany] = useState("G1");
   const [activeSession, setActiveSession] = useState<Session | null>(null);
-  const [leaderboard, setLeaderboard] = useState<Array<{name:string; klass:'3C'|'4C'; company:string; totalMin:number}>>([]);
+  const [leaderboard, setLeaderboard] = useState<Array<{name:string; klass:Klass; company:string; totalMin:number}>>([]);
   const [adminMode, setAdminMode] = useState(false);
   const [adminKey, setAdminKey] = useState("");
   const [allActive, setAllActive] = useState<Array<{session: Session; cadet: Cadet}>>([]);
@@ -197,8 +196,8 @@ export default function ASPApp() {
 
   async function fetchLeaderboard() {
     if (hasSupabase && supabase) {
-      const { data, error } = await supabase.rpc('asp_leaderboard_all_time');
-      if (!error && data) {
+      const { data } = await supabase.rpc('asp_leaderboard_all_time');
+      if (data) {
         const typed = data as unknown as LeaderboardRow[];
         setLeaderboard(
           typed.map(r => ({
@@ -215,7 +214,7 @@ export default function ASPApp() {
     // Fallback to localStorage aggregation (all-time)
     const raw = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
     const ids = new Set(raw.map(r => r.cadet_id));
-    const rows: Array<{name:string; klass:'3C'|'4C'; company:string; totalMin:number}> = [];
+    const rows: Array<{name:string; klass:Klass; company:string; totalMin:number}> = [];
     ids.forEach(id => {
       const c = JSON.parse(localStorage.getItem(`${LS_CADET}_${id}`) || "null") as Cadet | null;
       if (!c) return;
@@ -230,12 +229,12 @@ export default function ASPApp() {
 
   async function fetchAllActive() {
     if (hasSupabase && supabase) {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from('sessions')
         .select('id, cadet_id, sign_in, sign_out, voided, cadets(name, klass, company, id)')
         .is('sign_out', null);
 
-      if (!error && data) {
+      if (data) {
         const rows = data as unknown as ActiveRow[];
         setAllActive(
           rows.map(row => ({
@@ -318,11 +317,11 @@ export default function ASPApp() {
   }
 
   async function handleSignIn() {
-    if (!name || (klass !== '3C' && klass !== '4C')) { setStatusMsg("Enter your name and class year."); return; }
+    if (!name || klass === 'none') { setStatusMsg("Enter your name and class year."); return; }
     if (!withinAspHours() && !adminMode) { setStatusMsg("ASP is closed right now (Mon/Wed 19:30–21:30 ET)."); return; }
 
     const typedName = name.trim();
-    let c: Cadet = { id: crypto.randomUUID(), name: typedName, klass, company };
+    let c: Cadet = { id: crypto.randomUUID(), name: typedName, klass: klass as Klass, company };
 
     if (hasSupabase && supabase) {
       // Try to find an existing cadet by identity so multiple people can sign in from the same device
@@ -330,7 +329,7 @@ export default function ASPApp() {
         .from('cadets')
         .select('id')
         .eq('name', typedName)
-        .eq('klass', klass)
+        .eq('klass', klass as Klass)
         .eq('company', company)
         .maybeSingle();
 
@@ -347,9 +346,9 @@ export default function ASPApp() {
     } else {
       // Local-only fallback: if switching identity, don't reuse the cached cadet
       if (cadet && (cadet.name !== typedName || cadet.klass !== klass || cadet.company !== company)) {
-        c.id = crypto.randomUUID(); // new identity → new id
+        c.id = crypto.randomUUID();
       } else if (cadet) {
-        c = cadet; // same identity → reuse
+        c = cadet;
       }
     }
 
@@ -360,30 +359,18 @@ export default function ASPApp() {
     let newSession: Session = { id: crypto.randomUUID(), cadet_id: c.id, sign_in: nowIso, sign_out: null };
 
     if (hasSupabase && supabase) {
-      // Ensure cadet exists (and surface errors clearly)
       const { error: cadetErr } = await supabase
         .from('cadets')
-        .upsert(
-          { id: c.id, name: c.name, klass: c.klass, company: c.company },
-          { onConflict: 'id' }
-        );
+        .upsert({ id: c.id, name: c.name, klass: c.klass, company: c.company }, { onConflict: 'id' });
+      if (cadetErr) { setStatusMsg(`Cadet save failed: ${cadetErr.message}`); return; }
 
-      if (cadetErr) {
-        setStatusMsg(`Cadet save failed: ${cadetErr.message}`);
-        return;
-      }
-
-      // Only insert session if cadet write succeeded
       const { data, error: sessionErr } = await supabase
         .from('sessions')
         .insert({ id: newSession.id, cadet_id: c.id, sign_in: nowIso, sign_out: null })
         .select()
         .single();
 
-      if (sessionErr) {
-        setStatusMsg(`Sign-in failed: ${sessionErr.message}`);
-        return;
-      }
+      if (sessionErr) { setStatusMsg(`Sign-in failed: ${sessionErr.message}`); return; }
 
       newSession = {
         id: (data as { id: string }).id,
@@ -392,7 +379,6 @@ export default function ASPApp() {
         sign_out: (data as { sign_out: string | null }).sign_out
       };
     } else {
-      // local history list
       const hist = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
       hist.push(newSession);
       localStorage.setItem(LS_SESSIONS, JSON.stringify(hist));
@@ -436,11 +422,10 @@ export default function ASPApp() {
     const start = new Date(activeSession.sign_in).getTime();
     const end = activeSession.sign_out ? new Date(activeSession.sign_out).getTime() : nowTs;
     const sec = Math.max(0, Math.floor((end - start) / 1000));
-    return Math.min(sec, TWO_HOURS_SEC); // cap display at 2h
+    return Math.min(sec, TWO_HOURS_SEC);
   }
 
   function totalFor() {
-    // Only local aggregation of cached sessions for current user (used to show lifetime total)
     const c = cadet; if (!c) return 0;
     const sessions = JSON.parse(localStorage.getItem(LS_SESSIONS) || "[]") as Session[];
     return sessions
@@ -465,7 +450,6 @@ export default function ASPApp() {
     }
   }, [adminKey, ADMIN_KEY]);
 
-  // --- Admin toggle ---
   function disableAdmin() {
     setAdminMode(false);
     setAdminKey('');
@@ -477,7 +461,6 @@ export default function ASPApp() {
 
   const openNow = withinAspHours();
   const nextWindow = useMemo(() => {
-    // Compute next ASP window (Mon/Wed 19:30–21:30 ET) text
     const now = nyNow();
     const targetDays = [1, 3]; // Mon, Wed
     const candidates: Date[] = [];
@@ -485,7 +468,6 @@ export default function ASPApp() {
       const d = new Date(now); d.setDate(now.getDate() + add);
       const dow = d.getDay();
       if (targetDays.includes(dow)) {
-        // 19:30
         const dt = new Date(d);
         dt.setHours(19,30,0,0);
         candidates.push(dt);
@@ -508,7 +490,7 @@ export default function ASPApp() {
               <CardTitle className="flex items-center gap-2"><Trophy className="w-5 h-5"/> Athena&rsquo;s Study Parthenon</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
-              <div className="font-medium">Company G1 • 3C & 4C</div>
+              <div className="font-medium">Company G1 • 1C–4C</div>
               <div className="flex items-center gap-2 text-slate-600"><Clock className="w-4 h-4"/> Mon & Wed 19:30–21:30 (ET)</div>
               <div className="text-slate-600">Next session: <span className="font-semibold">{nextWindow}</span></div>
               <div className={`text-xs inline-flex px-2 py-1 rounded-full ${openNow? 'bg-green-100 text-green-700':'bg-amber-100 text-amber-700'}`}>{openNow? 'Open now':'Closed'}</div>
@@ -520,8 +502,10 @@ export default function ASPApp() {
             <CardContent className="space-y-3">
               <Input placeholder="Full name" value={name} onChange={(e)=>setName(e.target.value)} />
               <Select value={klass} onValueChange={(v) => setKlass(v as Klass)}>
-                <SelectTrigger><SelectValue placeholder="Class (3C or 4C)" /></SelectTrigger>
+                <SelectTrigger><SelectValue placeholder="Class (1C–4C)" /></SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="1C">1C</SelectItem>
+                  <SelectItem value="2C">2C</SelectItem>
                   <SelectItem value="3C">3C</SelectItem>
                   <SelectItem value="4C">4C</SelectItem>
                 </SelectContent>
@@ -571,11 +555,12 @@ export default function ASPApp() {
             <CardContent>
               <Tabs defaultValue="all">
                 <TabsList>
-                  <TabsTrigger value="all">All</TabsTrigger>
-                  <TabsTrigger value="3C">3C</TabsTrigger>
-                  <TabsTrigger value="4C">4C</TabsTrigger>
+                  {TABS.map(tab => (
+                    <TabsTrigger key={tab} value={tab}>{tab === 'all' ? 'All' : tab}</TabsTrigger>
+                  ))}
                 </TabsList>
-                {['all','3C','4C'].map((tab) => (
+
+                {TABS.map((tab) => (
                   <TabsContent key={tab} value={tab}>
                     <Table>
                       <TableCaption>Total minutes (all-time).</TableCaption>
@@ -590,17 +575,19 @@ export default function ASPApp() {
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {leaderboard.filter(r => tab==='all' ? true : r.klass===tab).map((r, idx) => (
-                          <TableRow key={`${r.name}-${idx}`}>
-                            <TableCell>{idx+1}</TableCell>
-                            <TableCell className="font-medium">{r.name}</TableCell>
-                            <TableCell>{r.klass}</TableCell>
-                            <TableCell>{r.company}</TableCell>
-                            <TableCell className="text-right">{formatHM(r.totalMin)}</TableCell>
-                            <TableCell className="text-right">{Math.floor(r.totalMin/240)}</TableCell>
-                          </TableRow>
-                        ))}
-                        {leaderboard.filter(r => tab==='all' ? true : r.klass===tab).length===0 && (
+                        {leaderboard
+                          .filter(r => tab === 'all' ? true : r.klass === tab)
+                          .map((r, idx) => (
+                            <TableRow key={`${r.name}-${idx}`}>
+                              <TableCell>{idx+1}</TableCell>
+                              <TableCell className="font-medium">{r.name}</TableCell>
+                              <TableCell>{r.klass}</TableCell>
+                              <TableCell>{r.company}</TableCell>
+                              <TableCell className="text-right">{formatHM(r.totalMin)}</TableCell>
+                              <TableCell className="text-right">{Math.floor(r.totalMin/240)}</TableCell>
+                            </TableRow>
+                          ))}
+                        {leaderboard.filter(r => tab === 'all' ? true : r.klass === tab).length === 0 && (
                           <TableRow><TableCell colSpan={6} className="text-center text-slate-500">No data yet.</TableCell></TableRow>
                         )}
                       </TableBody>
