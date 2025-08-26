@@ -26,7 +26,7 @@ import { AlertTriangle, Clock, LogIn, LogOut, Medal, Shield, Trophy } from "luci
 const TZ = "America/New_York";
 const TWO_HOURS_SEC = 2 * 60 * 60;
 
-function nyNow() { return new Date(); } // JS Date is UTC internally; we treat as "now" and derive ET via formatters
+function nyNow() { return new Date(); }
 
 function isAspOpen(date = nyNow()) {
   // ASP hours: Monday & Wednesday 19:30–21:30 ET
@@ -166,9 +166,10 @@ export default function ASPApp() {
     if (s) setActiveSession(JSON.parse(s));
   }, []);
 
-  // Live ticker + client auto sign-out at 2h (server will also clamp at 21:30 ET)
+  // Live ticker + client auto sign-out at 2h
   useEffect(() => {
     if (!activeSession || activeSession.sign_out) return;
+
     const intId = window.setInterval(() => setNowTs(Date.now()), 1000);
 
     // 2h cap client-side
@@ -193,7 +194,7 @@ export default function ASPApp() {
     }, delay);
 
     return () => { window.clearInterval(intId); window.clearTimeout(toId); };
-  }, [activeSession?.id, activeSession?.sign_in, activeSession?.sign_out, adminMode]);
+  }, [activeSession, adminMode]); // include activeSession to satisfy react-hooks/exhaustive-deps
 
   // Initial / admin refresh loads
   useEffect(() => { fetchLeaderboard(); if (adminMode) fetchAllActive(); }, [adminMode]);
@@ -284,15 +285,39 @@ export default function ASPApp() {
   }
 
   // Edit sessions (load last 20)
+  type CadBrief = { id: string; name: string; klass: Klass; company: string };
+
   async function openEditForLeaderboardRow(row: {name:string; klass:Klass; company:string}) {
     if (!hasSupabase || !supabase) { setStatusMsg("Editing requires Supabase."); return; }
+
     // resolve cadet id (exact then case-insensitive)
-    const { data: exact } = await supabase.from('cadets').select('id,name,klass,company').eq('name', row.name).eq('klass', row.klass).eq('company', row.company).limit(1);
-    let cad: {id:string; name:string; klass:Klass; company:string} | null = exact && exact.length ? exact[0] as any : null;
-    if (!cad) {
-      const { data: ci } = await supabase.from('cadets').select('id,name,klass,company').ilike('name', row.name).eq('klass', row.klass).eq('company', row.company).limit(1);
-      if (ci && ci.length) cad = ci[0] as any;
+    const { data: exact } = await supabase
+      .from('cadets')
+      .select('id,name,klass,company')
+      .eq('name', row.name)
+      .eq('klass', row.klass)
+      .eq('company', row.company)
+      .limit(1);
+
+    let cad: CadBrief | null = null;
+    if (Array.isArray(exact) && exact.length > 0) {
+      const [row0] = exact as unknown as CadBrief[];
+      cad = row0;
+    } else {
+      const { data: ci } = await supabase
+        .from('cadets')
+        .select('id,name,klass,company')
+        .ilike('name', row.name)
+        .eq('klass', row.klass)
+        .eq('company', row.company)
+        .limit(1);
+
+      if (Array.isArray(ci) && ci.length > 0) {
+        const [row1] = ci as unknown as CadBrief[];
+        cad = row1;
+      }
     }
+
     if (!cad) { setStatusMsg("Could not resolve cadet id."); return; }
 
     const { data: sess, error } = await supabase
@@ -378,7 +403,7 @@ export default function ASPApp() {
         .upsert({ id: c.id, name: c.name, klass: c.klass, company: c.company }, { onConflict: 'id' });
       if (cadetErr) { setStatusMsg(`Cadet save failed: ${cadetErr.message}`); return; }
 
-      // NEW: Resume already-open session instead of creating a new one (prevents overlaps)
+      // Resume already-open session instead of creating a new one (prevents overlaps)
       const { data: openSess } = await supabase
         .from('sessions')
         .select('id,cadet_id,sign_in,sign_out')
@@ -739,7 +764,7 @@ export default function ASPApp() {
                           <Button size="sm" onClick={saveEdits} disabled={savingEdits}>{savingEdits ? "Saving..." : "Save changes"}</Button>
                         </div>
                       </div>
-                      <div className="text-xs text-slate-600 mb-2">Times are in your device’s local timezone. Leaderboard caps minutes to ASP window (ET) server-side.</div>
+                      <div className="text-xs text-slate-600 mb-2">Times are in your device&rsquo;s local timezone. Leaderboard caps minutes to ASP window (ET) server-side.</div>
                       <Table>
                         <TableHeader>
                           <TableRow>
