@@ -51,14 +51,12 @@ function formatHM(totalMinutes: number) {
 function msToMin(ms: number) { return Math.max(0, Math.floor(ms / 60000)); }
 function errMsg(e: unknown) { return e instanceof Error ? e.message : String(e); }
 
-// Name normalization: trim, collapse spaces, title-case-ish (but we store normalized string)
+// Name normalization: trim, collapse spaces
 function normalizeName(raw: string) {
-  const collapsed = raw.trim().replace(/\s+/g, " ");
-  // Keep exact casing as entered but for matching we’ll compare case-insensitively.
-  return collapsed;
+  return raw.trim().replace(/\s+/g, " ");
 }
 
-// ET parts/read helpers
+// ET helpers
 function etParts(d: Date) {
   const fmt = new Intl.DateTimeFormat("en-US", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
   const parts = fmt.formatToParts(d).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {} as Record<string,string>);
@@ -147,7 +145,7 @@ export default function ASPApp() {
   const [editCadet, setEditCadet] = useState<Cadet | null>(null);
   const [editSessions, setEditSessions] = useState<Session[]>([]);
   const [editDraft, setEditDraft] = useState<Record<string, {sign_in: string; sign_out: string | null}>>({});
-  const [editOverride, setEditOverride] = useState<string>(""); // minutes as string for input
+  const [editOverride, setEditOverride] = useState<string>("");
   const [savingEdits, setSavingEdits] = useState(false);
 
   // Load cached identity / session
@@ -183,12 +181,11 @@ export default function ASPApp() {
     }, delay);
 
     return () => { window.clearInterval(intId); window.clearTimeout(toId); };
-  }, [activeSession]); // include activeSession to satisfy lint
+  }, [activeSession]);
 
   // Initial loads
   useEffect(() => { void fetchLeaderboard(); }, []);
   useEffect(() => {
-    // load overrides whenever we refresh the leaderboard
     if (!hasSupabase || !supabase) return;
     (async () => {
       const { data } = await supabase.from('leaderboard_overrides').select('cadet_id, minutes_override');
@@ -198,13 +195,12 @@ export default function ASPApp() {
         setOverridesMap(map);
       }
     })();
-  }, [leaderboard.length]); // re-check overrides when list size changes
+  }, [leaderboard.length]);
 
   // ---------- Data loads ----------
   async function fetchLeaderboard() {
     if (hasSupabase && supabase) {
-      // Try v2 (with cadet_id); fall back to v1
-      const v2 = await supabase.rpc('asp_leaderboard_all_time_v2'); // name, klass, company, total_min, cadet_id
+      const v2 = await supabase.rpc('asp_leaderboard_all_time_v2');
       if (!v2.error && Array.isArray(v2.data)) {
         const rows = v2.data as unknown as LeaderboardRowDBv2[];
         setLeaderboard(rows.map(r => ({
@@ -217,10 +213,9 @@ export default function ASPApp() {
         return;
       }
 
-      const v1 = await supabase.rpc('asp_leaderboard_all_time'); // name, klass, company, total_min
+      const v1 = await supabase.rpc('asp_leaderboard_all_time');
       if (!v1.error && Array.isArray(v1.data)) {
         const base = v1.data as unknown as LeaderboardRowDBv1[];
-        // resolve cadet ids to support overrides
         const withIds: Array<{cadetId?: string; name:string; klass:Klass; company:string; totalMin:number}> = [];
         for (const r of base) {
           const { data: cad } = await supabase
@@ -228,7 +223,7 @@ export default function ASPApp() {
             .select('id')
             .eq('klass', r.klass)
             .eq('company', r.company)
-            .ilike('name', r.name) // case-insensitive equality-ish
+            .ilike('name', r.name)
             .limit(1);
           const cadId = Array.isArray(cad) && cad.length ? (cad[0] as {id:string}).id : undefined;
           withIds.push({ cadetId: cadId, name: r.name, klass: r.klass, company: r.company, totalMin: Math.floor(Number(r.total_min)) });
@@ -259,14 +254,12 @@ export default function ASPApp() {
     localStorage.setItem(`asp_current_cadet_${c.id}`, JSON.stringify(c));
   }
 
-  // Compute minutes already earned tonight (ET) for a set of sessions
   function minutesTonightET(sessions: Session[], now: Date): number {
     const tonightKey = etDateKey(now);
     let sum = 0;
     for (const s of sessions) {
       const sin = new Date(s.sign_in);
       const sout = new Date(s.sign_out ?? now);
-      // only count rows whose sign_in ET day equals tonight
       if (etDateKey(sin) !== tonightKey) continue;
       const a = minutesOfDayET(sin);
       const b = minutesOfDayET(sout);
@@ -282,7 +275,7 @@ export default function ASPApp() {
     if (!isAspOpen(nyNow())) { setStatusMsg("ASP is closed right now (Mon/Wed 19:30–21:30 ET)."); return; }
 
     const canonicalName = normalizeName(name);
-    let c: Cadet = { id: crypto.randomUUID(), name: canonicalName, klass: klass as Klass, company };
+    const c: Cadet = { id: crypto.randomUUID(), name: canonicalName, klass: klass as Klass, company };
 
     if (hasSupabase && supabase) {
       // 1) Find existing cadet (exact normalized match first, then case-insensitive)
@@ -316,7 +309,6 @@ export default function ASPApp() {
       }
 
       // 4) Guard: if they already hit 120 min in tonight’s window, block another sign-in
-      //    Fetch recent sessions for this cadet (last 36h to be safe)
       const since = new Date(Date.now() - 36*60*60*1000).toISOString();
       const recent = await supabase
         .from('sessions')
@@ -370,9 +362,8 @@ export default function ASPApp() {
     const nowIso = new Date().toISOString();
 
     if (hasSupabase && supabase) {
-      const { data, error } = await supabase.from('sessions').update({ sign_out: nowIso }).eq('id', activeSession.id).select().single();
+      const { error } = await supabase.from('sessions').update({ sign_out: nowIso }).eq('id', activeSession.id).select().single();
       if (error) { setStatusMsg(`Sign-out failed: ${error.message}`); return; }
-      // updated returned but we don't use it further
     } else {
       const hist = JSON.parse(localStorage.getItem("asp_sessions") || "[]") as Session[];
       const idx = hist.findIndex(s => s.id === activeSession.id);
@@ -526,7 +517,6 @@ export default function ASPApp() {
           .upsert({ cadet_id: editCadet.id, minutes_override: minutes }, { onConflict: 'cadet_id' });
         if (ovErr) throw ovErr;
       } else {
-        // empty input → remove override
         await supabase.from('leaderboard_overrides').delete().eq('cadet_id', editCadet.id);
       }
 
@@ -563,7 +553,7 @@ export default function ASPApp() {
               <div className="font-medium">Company G1 • 1C–4C</div>
               <div className="flex items-center gap-2 text-slate-600"><Clock className="w-4 h-4"/> Mon & Wed 19:30–21:30 (ET)</div>
               <div className="text-slate-600">Next session: <span className="font-semibold">{nextWindow}</span></div>
-              <div className={`text-xs inline-flex px-2 py-1 rounded-full ${openNow? 'bg-green-100 text-green-700':'bg-amber-100 text-amber-700'}`}>{openNow? 'Open now':'Closed'}</div>
+              <div className={`text-xs inline-flex px-2 py-1 rounded-full ${isAspOpen()? 'bg-green-100 text-green-700':'bg-amber-100 text-amber-700'}`}>{isAspOpen()? 'Open now':'Closed'}</div>
             </CardContent>
           </Card>
 
@@ -602,9 +592,28 @@ export default function ASPApp() {
             <CardHeader><CardTitle className="text-base flex items-center gap-2"><Clock className="w-4 h-4"/> Live Session</CardTitle></CardHeader>
             <CardContent className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
               <div className="md:col-span-2">
-                <div className="text-2xl font-semibold">{formatHMS(currentElapsedSec())}</div>
+                <div className="text-2xl font-semibold">{formatHMS((() => {
+                  if (!activeSession) return 0;
+                  const start = new Date(activeSession.sign_in).getTime();
+                  const end = activeSession.sign_out ? new Date(activeSession.sign_out).getTime() : nowTs;
+                  const sec = Math.max(0, Math.floor((end - start) / 1000));
+                  return Math.min(sec, TWO_HOURS_SEC);
+                })())}</div>
                 <div className="text-sm text-slate-600">{activeSession ? `Signed in at ${new Date(activeSession.sign_in).toLocaleTimeString('en-US', { timeZone: TZ, hour:'numeric', minute:'2-digit' })} ET` : 'Not currently signed in'}</div>
-                {cadet && <div className="text-sm text-slate-600 mt-2">Lifetime (local): <span className="font-semibold">{formatHM(userTotalLocal)}</span> • PMI days: <span className="font-semibold">{Math.floor(userTotalLocal/240)}</span></div>}
+                {cadet && <div className="text-sm text-slate-600 mt-2">Lifetime (local): <span className="font-semibold">{formatHM((() => {
+                  if (!cadet) return 0;
+                  const sessions = JSON.parse(localStorage.getItem("asp_sessions") || "[]") as Session[];
+                  return sessions
+                    .filter(s => s.cadet_id === cadet.id)
+                    .reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
+                })())}</span> • PMI days: <span className="font-semibold">{Math.floor((() => {
+                  if (!cadet) return 0;
+                  const sessions = JSON.parse(localStorage.getItem("asp_sessions") || "[]") as Session[];
+                  const mins = sessions
+                    .filter(s => s.cadet_id === cadet.id)
+                    .reduce((acc, s) => acc + msToMin(new Date(s.sign_out ?? new Date()).getTime() - new Date(s.sign_in).getTime()), 0);
+                  return mins/240;
+                })())}</span></div>}
               </div>
               <div className="text-xs text-slate-600 bg-slate-50 rounded-xl p-3">
                 <div className="font-semibold mb-1">Rules</div>
@@ -701,7 +710,6 @@ export default function ASPApp() {
                           <Button size="sm" variant="destructive" onClick={async ()=>{
                             if (!hasSupabase || !supabase) return;
                             if (!confirm(`Remove ${r.name} from leaderboard? This voids sessions (not overrides).`)) return;
-                            // resolve id if missing
                             let cadId = r.cadetId;
                             if (!cadId) {
                               const { data: cad } = await supabase
